@@ -1,8 +1,8 @@
 # Multithreaded Proxy Server and Client
 
-A C-based operating systems project that forwards HTTP requests through a multithreaded proxy server and lets a client save the returned page as an HTML file.
+A C-based operating systems project that fetches HTTP and HTTPS webpages through a multithreaded proxy server and lets a client save the returned page as an HTML file.
 
-> **Status:** Milestones 1-3 implemented: plain HTTP forwarding, HTML saving, and bounded multithreading in both server and batch client. HTTPS and redirect following are not implemented yet.
+> **Status:** Milestones 1-4 implemented: HTTP/HTTPS fetching, bounded redirects, HTML saving, and bounded multithreading in both server and batch client.
 
 ## Overview
 
@@ -18,17 +18,18 @@ This project demonstrates socket programming, concurrent request handling, and r
 
 ## Implemented Features
 
-- **URL input:** Accept a plain HTTP URL through the command-line client, including a path, query string, and explicit port. URL fragments are not sent to the website.
-- **Request forwarding:** The proxy resolves the destination and forwards an HTTP GET request. The client contacts the proxy rather than fetching the website directly.
+- **URL input:** Accept an HTTP or HTTPS URL through the command-line client, including a path, query string, and explicit port. URL fragments are not sent to the website.
+- **Destination fetching:** Each proxy worker uses its own libcurl handle for the website GET request. The client contacts the proxy rather than fetching the website directly.
+- **HTTPS and redirects:** Verify the destination certificate and hostname, follow at most 5 redirects, and restrict initial/redirect protocols to HTTP and HTTPS. Display the final URL and redirect count.
 - **Concurrent clients:** Serve up to 32 active connections with detached POSIX worker threads. Excess connections receive HTTP 503.
 - **Threaded batch downloads:** Download a URL list with 1-16 client workers (default 4). Each job owns its socket and output file; all filenames are assigned before workers start.
 - **Request logs:** Server logs carry request identifiers, worker start/finish events, and relayed byte counts. Batch results identify each URL and summarize saved and failed jobs.
 - **HTML output:** Save the response body to a chosen filename or generate one under `downloads/`. Automatic names receive numeric suffixes on collision. Explicit filenames are never overwritten.
-- **Response handling:** Read split headers, Content-Length, chunked transfer coding, and connection-close-delimited bodies. Only successful HTML responses with identity content encoding are saved.
+- **Response handling:** Decode supported destination compression and chunked transfers in the proxy. Return fresh Content-Length framing and save only successful HTML/XHTML bodies in the client.
 - **Failure handling:** Report invalid input, connection failures, destination HTTP errors, unsupported responses, and file-write failures. Failed downloads do not leave completed output files.
 - **Resource cleanup:** Close sockets and files and release per-request memory. Download into a temporary file and publish it only on success.
 
-The current implementation supports plain HTTP. HTTPS and redirect following are later milestones needed for broader webpage support. Response caching is an optional extension.
+Response caching remains an optional extension. A website can still reject automated requests or require authentication or browser execution.
 
 ## How It Works
 
@@ -43,7 +44,9 @@ Client                         Proxy Server                   Destination Server
   +-- Save response body as HTML      +-- Clean up request resources   |
 ```
 
-The proxy will accept incoming connections and assign each accepted connection to a worker thread. Each worker will handle its own request and destination connection. Any shared mutable state introduced later, such as a cache, will need synchronization.
+The proxy accepts incoming connections and assigns each accepted connection to a worker thread. Each worker owns a libcurl handle and a temporary response file. It first fetches the complete, decoded body within the size/time limits, then returns the final status, content type, final URL, redirect count, and body. Temporary files are closed on success and failure.
+
+TLS is used between the proxy and an HTTPS destination. The dedicated client connects to the proxy over local TCP on `127.0.0.1`; this project does not implement browser CONNECT tunneling or TLS interception.
 
 Saving an HTML response does not download all linked images, stylesheets, or scripts. A complete offline website downloader is outside the initial scope.
 
@@ -52,7 +55,8 @@ Saving an HTML response does not download all linked images, stylesheets, or scr
 | Component | Technology |
 | --- | --- |
 | Programming language | C |
-| Network communication | TCP sockets and HTTP |
+| Client-to-proxy communication | POSIX TCP sockets and HTTP request/response framing |
+| Destination HTTP/HTTPS | libcurl C API with certificate verification |
 | Concurrency | POSIX threads (`pthread`) |
 | Connection limit | POSIX semaphore |
 | Development environment | Linux, or a Linux environment through WSL on Windows |
@@ -65,10 +69,21 @@ The intended development environment needs:
 
 - A Linux environment with networking access.
 - GCC and the development headers needed for sockets and POSIX threads.
+- libcurl development headers (7.85 or later), pkg-config, and trusted CA certificates.
+- Python 3 and OpenSSL for the local test fixtures only.
 - Git for version control.
 - A text editor or IDE.
 
 The project was built and tested in Ubuntu through WSL. Run the following commands in a Linux terminal, from the project directory. Native Windows MinGW is not the target for this POSIX implementation.
+
+Install build/test dependencies on Ubuntu if they are not already available:
+
+```bash
+sudo apt-get update
+sudo apt-get install build-essential libcurl4-openssl-dev pkg-config ca-certificates python3 openssl
+```
+
+The server, client, threading, and file handling are implemented in C. libcurl is a C library linked into the server; the application does not invoke the `curl` command or a Python downloader.
 
 ```bash
 make
@@ -83,7 +98,7 @@ Start the proxy in one terminal:
 In another terminal, fetch an HTTP page through the proxy:
 
 ```bash
-./proxy_client 127.0.0.1 8080 http://example.com/ --output page.html
+./proxy_client 127.0.0.1 8080 https://example.com/ --output page.html
 ```
 
 Omit `--output` to generate a filename:
@@ -92,7 +107,7 @@ Omit `--output` to generate a filename:
 ./proxy_client 127.0.0.1 8080 http://example.com/
 ```
 
-Public sites may redirect to HTTPS or reject automated requests. For a repeatable offline demonstration, create a small HTML page and start a local origin server in a third terminal:
+Public sites may redirect or reject automated requests. For a repeatable offline demonstration, create a small HTML page and start a local origin server in a third terminal:
 
 ```bash
 mkdir -p /tmp/os-proxy-demo
@@ -118,7 +133,7 @@ Keep the proxy and local demo origin running, then run:
 ./proxy_client 127.0.0.1 8080 --batch examples/urls.txt --jobs 3
 ```
 
-The example list requests the local HTML page three times with different query strings. For other pages, create a text file containing one HTTP URL per line. Blank lines and lines starting with `#` are ignored; the whole list is validated before downloads begin.
+The example list requests the local HTML page three times with different query strings. For other pages, create a text file containing one HTTP or HTTPS URL per line. Blank lines and lines starting with `#` are ignored; the whole list is validated before downloads begin.
 
 Each run creates a unique `downloads/batch_XXXXXX/` directory. Files are named with the job number and sanitized hostname/path, such as `0001_127.0.0.1_index.html`. Duplicate URLs and simultaneous batch runs cannot select the same output path.
 
@@ -131,10 +146,13 @@ Failed jobs do not stop unrelated downloads. The final summary reports saved/fai
 | File | Purpose |
 | --- | --- |
 | `proxy_server.c` | Accept client connections, create bounded workers, fetch and relay HTTP responses. |
+| `fetch.c` / `fetch.h` | Per-worker libcurl fetching, certificate verification, redirects, decompression, limits, and temporary response storage. |
 | `proxy_client.c` | Fetch one URL or a batch through the proxy, decode response framing, and save HTML. |
 | `net.c` / `net.h` | URL validation, destination resolution, timed connections, and complete socket writes. |
 | `tests/integration.py` | Local HTTP fixtures and end-to-end checks. |
 | `tests/concurrency.py` | Client worker limits, server saturation/recovery, timeouts, disconnects, and connection churn. |
+| `tests/https.py` | Controlled HTTPS certificates, redirects, decoded bodies, mixed batches, size limits, and fetch timeout. |
+| `tests/public_smoke.py` | Optional live HTTP/HTTPS checks through the C proxy. |
 | `examples/urls.txt` | Small batch input for the local demo origin. |
 | `proxy_server_with_cache.c` / `proxy_server_without_cache.c` | Original tutorial reference implementations, preserved separately. |
 | `proxy_parse.c` / `proxy_parse.h` | Original tutorial parser; not linked into the new milestone executables. |
@@ -143,7 +161,7 @@ Failed jobs do not stop unrelated downloads. The final summary reports saved/fai
 
 ## Implementation Plan
 
-The HTTP server, HTML-saving client, and concurrency milestone are implemented. Next: add HTTPS and redirects. Consider caching after the required workflow is complete.
+The HTTP/HTTPS server, HTML-saving client, concurrency, and URL-support milestones are implemented. Next: consolidate the final demonstration and viva documentation. Consider caching only as an optional extension.
 
 ## Validation Plan
 
@@ -167,7 +185,21 @@ make clean
 make
 ```
 
-Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end-to-end scenarios and 10 concurrency scenarios, with no reported sanitizer errors. These include 16 concurrent downloads, a bounded threaded batch, 410 sequential requests, all 32 server slots in use, overload rejection/recovery, a client reset, and an idle-request timeout. Tests use a local origin and do not require a public website.
+Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end-to-end scenarios, 10 concurrency scenarios, and 24 HTTPS/redirect scenarios, with no reported sanitizer errors. These cover 410 sequential requests, 32-slot saturation/recovery, trusted and rejected certificates, hostname verification, HTTP/HTTPS redirects, redirect loops, decoded gzip/chunked content, a decoded size limit, timeout recovery, and mixed-protocol batch downloads. Tests use local origins and temporary certificates, without changing the system trust store. Public HTTP and HTTPS example pages were also fetched successfully through the proxy.
+
+An optional internet check fetches public HTTP and HTTPS example pages through the proxy:
+
+```bash
+make smoke
+```
+
+For a private CA, start the proxy with an explicit PEM CA bundle. Certificate and hostname checks remain enabled:
+
+```bash
+PROXY_CA_BUNDLE=/absolute/path/to/ca-bundle.pem ./proxy_server 8080
+```
+
+This replaces the default CA bundle for that server process. The default public-web setup uses the system CA bundle. The HTTPS tests use this mechanism only with certificates generated inside their temporary test directory.
 
 | Scenario | Expected behavior |
 | --- | --- |
@@ -182,11 +214,12 @@ Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end
 
 ## Current Limitations
 
-- Plain HTTP GET only. HTTPS, automatic redirects, authentication, cookies, and JavaScript execution are not supported yet.
-- The client saves HTML/XHTML only and requests uncompressed data. If the origin still returns compressed content, the client rejects it rather than save incorrect HTML.
-- Downloads are limited to 50 MiB. Client response headers are limited to 64 KiB; incoming proxy requests are limited to 16 KiB.
-- Socket transfer operations time out after 15 seconds without progress; connection attempts use a 10-second timeout per destination address. System DNS resolution follows the resolver's own timeout behavior.
-- A close-delimited response has no declared body length, so an early clean EOF cannot always be distinguished from a complete response. Declared-length and chunked truncation are detected.
+- HTTP/HTTPS GET webpage fetching only. Authentication, persistent cookie sessions, JavaScript execution, and browser CONNECT tunneling are not implemented.
+- The client saves HTML/XHTML only. Destination compression support depends on the installed libcurl build; decoded responses are returned without stale compression or chunking headers.
+- Both declared destination sizes and decoded bodies are capped at 50 MiB. Destination/client response headers are limited to 64 KiB per response block; incoming proxy requests are limited to 16 KiB. Each worker uses a temporary disk file, so 32 maximum-size in-flight responses can require about 1.6 GiB of temporary storage.
+- Destination fetches have an 8-second connection timeout and a 20-second total timeout. The client waits up to 30 seconds without response progress; incoming server socket operations time out after 15 seconds without progress. System resolver behavior depends on the installed libcurl build.
+- At most 5 redirects are followed. HTTP-to-HTTPS and HTTPS-to-HTTP redirects are supported; redirects to other protocols are rejected.
+- Declared-length and chunked truncation are detected before returning a successful fetch. An upstream close-delimited body has no declared length with which to distinguish an early clean EOF from completion.
 - The server serves at most 32 active requests. Multiple batch clients can exceed that limit and receive HTTP 503; automatic retries are not implemented.
 - Completed files are finalized using POSIX hard links. Use a filesystem that supports them. No cache is enabled in the project executables.
 
@@ -200,6 +233,9 @@ Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end
 - **TCP streams:** Why one send or receive operation may not transfer an entire message.
 - **Synchronization:** When shared data needs protection and when request-local data does not.
 - **Resource management:** How sockets, thread resources, files, and memory are released.
+- **HTTPS:** Why destination certificate and hostname verification are needed, and which connection uses TLS.
+- **Library boundaries:** Our C code owns the client/proxy sockets and threading; libcurl handles the destination's HTTP/HTTPS protocol details.
+- **Redirects and normalization:** Why the final response gets new body-length framing after redirects and decompression.
 
 ## Possible Extensions
 
@@ -207,7 +243,7 @@ Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end
 - Add request timing and performance measurements to the existing request logs.
 - Compare sequential and concurrent request handling.
 - Compare the current bounded per-connection server workers with a persistent worker pool.
-- Add HTTPS and redirect handling.
+- Add configurable fetch limits and richer result metadata.
 
 ## Academic Context
 

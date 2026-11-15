@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -29,11 +30,16 @@ int parse_http_url(const char *text, struct http_url *url, char *error, size_t s
     if (strlen(text) >= URL_LIMIT) { why = "URL is too long"; goto fail; }
     for (const char *p = text; *p; ++p)
         if ((unsigned char)*p <= 32 || (unsigned char)*p >= 127) goto fail;
-    if (strncmp(text, "http://", 7)) {
-        why = "Only http:// URLs are supported; HTTPS is a later milestone";
+    size_t scheme_length;
+    if (!strncasecmp(text, "http://", 7)) {
+        strcpy(url->scheme, "http"); scheme_length = 7;
+    } else if (!strncasecmp(text, "https://", 8)) {
+        strcpy(url->scheme, "https"); scheme_length = 8;
+    } else {
+        why = "Only http:// and https:// webpage URLs are supported";
         goto fail;
     }
-    const char *start = text + 7;
+    const char *start = text + scheme_length;
     size_t length = strcspn(start, "/?#");
     if (!length || length >= sizeof(url->authority)) goto fail;
     memcpy(url->authority, start, length);
@@ -59,7 +65,7 @@ int parse_http_url(const char *text, struct http_url *url, char *error, size_t s
         if (!isalnum((unsigned char)*p) && !strchr(".-:_", *p)) goto fail;
     if (port && (!valid_port(port) || strlen(port) >= sizeof(url->port))) goto fail;
     strcpy(url->host, host);
-    strcpy(url->port, port ? port : "80");
+    strcpy(url->port, port ? port : (!strcmp(url->scheme, "https") ? "443" : "80"));
     const char *path = start + length;
     size_t path_length = strcspn(path, "#");
     size_t prefix = (*path != '/') ? 1 : 0;

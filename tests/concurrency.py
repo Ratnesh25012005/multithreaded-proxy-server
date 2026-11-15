@@ -80,7 +80,7 @@ def main():
                 checks += 1
 
                 source = Path(tmp) / "invalid.txt"
-                for contents in ["# empty\n", "https://example.com/\n", "http://bad host/\n", "http://x/\x00junk\n"]:
+                for contents in ["# empty\n", "ftp://example.com/\n", "http://bad host/\n", "http://x/\x00junk\n"]:
                     source.write_text(contents)
                     client(["--batch", str(source)], success=False)
                 client(["--batch", str(source), "--jobs", "0"], success=False)

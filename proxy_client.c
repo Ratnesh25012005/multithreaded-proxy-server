@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 struct reader {
@@ -21,6 +22,9 @@ struct reader {
 struct response {
     int status, chunked, has_length, html, encoded;
     uint64_t length;
+    char final_url[URL_LIMIT];
+    char proxy_error[256];
+    unsigned redirects;
 };
 
 static ssize_t read_some(struct reader *r, void *output, size_t limit) {
@@ -103,6 +107,16 @@ static int read_headers(struct reader *r, struct response *response) {
                     || (!strncasecmp(value, "application/xhtml+xml", 21) && (!value[21] || value[21] == ';'));
             } else if (!strcasecmp(line, "Content-Encoding")) {
                 response->encoded = strcasecmp(value, "identity") != 0;
+            } else if (!strcasecmp(line, "X-Proxy-Final-URL")) {
+                if (strlen(value) >= sizeof(response->final_url)) return -1;
+                strcpy(response->final_url, value);
+            } else if (!strcasecmp(line, "X-Proxy-Error")) {
+                if (strlen(value) >= sizeof(response->proxy_error)) return -1;
+                strcpy(response->proxy_error, value);
+            } else if (!strcasecmp(line, "X-Proxy-Redirects")) {
+                uint64_t redirects;
+                if (decimal_length(value, &redirects) || redirects > 5) return -1;
+                response->redirects = (unsigned)redirects;
             }
         }
         if (response->chunked && response->has_length) return -1;
@@ -191,6 +205,11 @@ static int download(const char *proxy_host, const char *proxy_port, const char *
     }
     int fd = connect_tcp(proxy_host, proxy_port);
     if (fd < 0) { fprintf(stderr, "Could not connect to proxy.\n"); return EXIT_FAILURE; }
+    /* The proxy can spend up to 20 seconds fetching before returning headers. */
+    struct timeval response_timeout = {30, 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &response_timeout, sizeof(response_timeout))) {
+        perror("Response timeout"); close(fd); return EXIT_FAILURE;
+    }
     int result = EXIT_FAILURE;
     FILE *file = NULL;
     char temporary[PATH_MAX] = "", output[PATH_MAX], base[160];
@@ -207,9 +226,15 @@ static int download(const char *proxy_host, const char *proxy_port, const char *
         fprintf(stderr, "Incomplete, oversized, or unsupported HTTP response headers.\n"); goto cleanup;
     }
     printf("HTTP status: %d [%s]\n", response.status, url_text);
+    if (*response.final_url)
+        printf("Final URL: %s (%u redirects)\n", response.final_url, response.redirects);
     if (response.status < 200 || response.status >= 300) {
-        if (response.status >= 300 && response.status < 400)
-            fprintf(stderr, "HTTP %d: page not saved. Redirect following is not implemented yet.\n", response.status);
+        if (*response.proxy_error)
+            fprintf(stderr, "HTTP %d%s: %s Page not saved.\n", response.status,
+                    response.status == 502 ? " Bad Gateway" : response.status == 504 ? " Gateway Timeout" : "",
+                    response.proxy_error);
+        else if (response.status >= 300 && response.status < 400)
+            fprintf(stderr, "HTTP %d: destination did not provide a usable redirect; page not saved.\n", response.status);
         else if (response.status == 502)
             fprintf(stderr, "HTTP 502 Bad Gateway: destination fetch failed; page not saved. "
                             "Check the destination URL and that its server is running.\n");
@@ -312,7 +337,7 @@ static int run_batch(const char *host, const char *port, const char *filename, s
         struct http_url parsed;
         char error[160];
         if (count == MAX_BATCH_URLS || parse_http_url(start, &parsed, error, sizeof(error))) {
-            fprintf(stderr, "Invalid URL list at line %zu (HTTP URLs only; maximum %d entries).\n",
+            fprintf(stderr, "Invalid URL list at line %zu (HTTP/HTTPS URLs only; maximum %d entries).\n",
                     line_number, MAX_BATCH_URLS); goto cleanup;
         }
         strcpy(jobs[count++].url, start);
@@ -373,7 +398,7 @@ int main(int argc, char **argv) {
             return download(argv[1], argv[2], argv[3], argc == 6 ? argv[5] : NULL);
     }
 usage:
-    fprintf(stderr, "Usage: %s PROXY_HOST PROXY_PORT HTTP_URL [--output FILE.html]\n"
+    fprintf(stderr, "Usage: %s PROXY_HOST PROXY_PORT HTTP_OR_HTTPS_URL [--output FILE.html]\n"
                     "       %s PROXY_HOST PROXY_PORT --batch URLS.txt [--jobs 1-16]\n", argv[0], argv[0]);
     return EXIT_FAILURE;
 }

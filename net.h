@@ -8,6 +8,7 @@
 #define BODY_LIMIT (50ULL * 1024 * 1024)
 
 struct http_url {
+    char scheme[6];
     char host[256];
     char authority[320];
     char port[6];

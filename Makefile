@@ -1,12 +1,14 @@
 CC = gcc
 CFLAGS = -std=c11 -O2 -g -Wall -Wextra -Wpedantic
 THREAD_FLAGS = -pthread
+CURL_CFLAGS = $(shell pkg-config --cflags libcurl)
+CURL_LIBS = $(shell pkg-config --libs libcurl)
 
-.PHONY: all clean test sanitize tutorial
+.PHONY: all clean test smoke sanitize tutorial
 all: proxy_server proxy_client
 
-proxy_server: proxy_server.c net.c net.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) proxy_server.c net.c $(LDFLAGS) -o $@
+proxy_server: proxy_server.c net.c net.h fetch.c fetch.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(CURL_CFLAGS) $(THREAD_FLAGS) proxy_server.c net.c fetch.c $(LDFLAGS) $(CURL_LIBS) -o $@
 
 proxy_client: proxy_client.c net.c net.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) proxy_client.c net.c $(LDFLAGS) -o $@
@@ -18,6 +20,10 @@ tutorial: proxy_server_with_cache.c proxy_parse.c proxy_parse.h
 test: all
 	python3 tests/integration.py
 	python3 tests/concurrency.py
+	python3 tests/https.py
+
+smoke: all
+	python3 tests/public_smoke.py
 
 sanitize:
 	$(MAKE) clean

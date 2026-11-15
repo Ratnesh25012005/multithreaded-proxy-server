@@ -158,7 +158,7 @@ def main():
                              "/empty", "/404", "/redirect", "/binary", "/gzip"]:
                     failed = run(path, "failed.html", success=False)
                     if path == "/redirect":
-                        assert b"Redirect following" in failed.stderr
+                        assert b"usable redirect" in failed.stderr
                     elif path == "/404":
                         assert b"HTTP 404" in failed.stderr and b"Redirect" not in failed.stderr
                     assert not (Path(tmp) / "failed.html").exists()
@@ -166,7 +166,7 @@ def main():
                     count += 1
 
                 run("/", "missing/fail.html", success=False)
-                run("/", success=False, url="https://example.com/")
+                run("/", success=False, url="ftp://example.com/")
                 run("/", success=False, url="http://bad host/")
                 dead_port = free_port()
                 failed = run("/", success=False, url=f"http://127.0.0.1:{dead_port}/")

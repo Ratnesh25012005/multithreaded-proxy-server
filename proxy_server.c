@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "net.h"
+#include "fetch.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -26,7 +27,8 @@ static void reply_error(int client, int status, const char *reason, const char *
                      status, reason, message);
     int h = snprintf(header, sizeof(header),
                      "HTTP/1.0 %d %s\r\nContent-Type: text/html\r\n"
-                     "Content-Length: %d\r\nConnection: close\r\n\r\n", status, reason, n);
+                     "Content-Length: %d\r\nX-Proxy-Error: %s\r\nConnection: close\r\n\r\n",
+                     status, reason, n, message);
     if (!send_all(client, header, (size_t)h)) send_all(client, body, (size_t)n);
 }
 
@@ -35,7 +37,7 @@ static void *serve_client(void *context) {
     struct connection connection = *(struct connection *)context;
     int client = connection.socket;
     free(context);
-    int upstream = -1;
+    struct fetch_result fetched = {0};
     size_t relayed = 0;
     const char *outcome = "client closed or request timed out";
     fprintf(stderr, "[request %lu] worker started\n", connection.id);
@@ -77,45 +79,41 @@ static void *serve_client(void *context) {
         reply_error(client, 400, "Bad Request", error);
         goto cleanup;
     }
-    upstream = connect_tcp(url.host, url.port);
-    if (upstream < 0) {
-        outcome = "destination connection failed";
-        fprintf(stderr, "[request %lu] could not connect to %s:%s\n", connection.id, url.host, url.port);
-        reply_error(client, 502, "Bad Gateway", "Could not connect to the destination.");
-        goto cleanup;
-    }
-    char outbound[URL_LIMIT + 512];
-    int length = snprintf(outbound, sizeof(outbound),
-                          "GET %s HTTP/1.0\r\nHost: %s\r\n"
-                          "User-Agent: OSProjectProxy/1.0\r\nAccept: text/html,application/xhtml+xml\r\n"
-                          "Accept-Encoding: identity\r\nConnection: close\r\n\r\n", url.path, url.authority);
-    if (length < 0 || (size_t)length >= sizeof(outbound)
-        || send_all(upstream, outbound, (size_t)length)) {
-        outcome = "destination request send failed";
-        reply_error(client, 502, "Bad Gateway", "Could not send the destination request.");
-        goto cleanup;
-    }
     fprintf(stderr, "[request %lu] fetching %s\n", connection.id, url_text);
-    outcome = "forwarding failed";
-    char buffer[8192];
-    int started = 0;
-    for (;;) {
-        ssize_t n = recv(upstream, buffer, sizeof(buffer), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            if (!started) reply_error(client, 502, "Bad Gateway", "Destination returned no response.");
-            outcome = n < 0 ? "upstream receive failed or timed out" : "upstream closed";
-            break;
-        }
-        started = 1;
-        if (send_all(client, buffer, (size_t)n)) { outcome = "client disconnected or send timed out"; break; }
-        relayed += (size_t)n;
+    if (fetch_page(url_text, &fetched)) {
+        outcome = fetched.error;
+        const char *reason = fetched.error_status == 504 ? "Gateway Timeout"
+                           : fetched.error_status == 500 ? "Internal Server Error" : "Bad Gateway";
+        reply_error(client, fetched.error_status, reason, fetched.error);
+        goto cleanup;
     }
+    /* The stored body is already dechunked/decompressed. Send fresh framing only. */
+    char header[URL_LIMIT + 1024];
+    int length = snprintf(header, sizeof(header),
+                          "HTTP/1.0 %ld Destination Response\r\nContent-Type: %s\r\n"
+                          "Content-Length: %zu\r\nX-Proxy-Final-URL: %s\r\n"
+                          "X-Proxy-Redirects: %ld\r\nConnection: close\r\n\r\n",
+                          fetched.status, *fetched.content_type ? fetched.content_type : "application/octet-stream",
+                          fetched.length, fetched.final_url, fetched.redirects);
+    if (length < 0 || (size_t)length >= sizeof(header) || send_all(client, header, (size_t)length)) {
+        outcome = "client disconnected before response"; goto cleanup;
+    }
+    relayed = (size_t)length;
+    outcome = "response delivered";
+    fprintf(stderr, "[request %lu] destination HTTP %ld; %ld redirects; final URL %s\n",
+            connection.id, fetched.status, fetched.redirects, fetched.final_url);
+    char buffer[8192];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), fetched.body)) > 0) {
+        if (send_all(client, buffer, bytes)) { outcome = "client disconnected or send timed out"; break; }
+        relayed += bytes;
+    }
+    if (ferror(fetched.body)) outcome = "temporary response read failed";
     goto cleanup;
 malformed:
-    reply_error(client, 400, "Bad Request", "Expected GET followed by an absolute HTTP URL.");
+    reply_error(client, 400, "Bad Request", "Expected GET followed by an absolute HTTP or HTTPS URL.");
 cleanup:
-    if (upstream >= 0) close(upstream);
+    if (fetched.body) fclose(fetched.body);
     close(client);
     fprintf(stderr, "[request %lu] worker finished: %s; %zu response bytes relayed\n",
             connection.id, outcome, relayed);
@@ -128,6 +126,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s PORT\n", argv[0]); return EXIT_FAILURE;
     }
     signal(SIGPIPE, SIG_IGN);
+    /* Initialize libcurl once, before any worker is created. Each worker owns its easy handle. */
+    if (fetch_global_init()) { fprintf(stderr, "Could not initialize libcurl.\n"); return EXIT_FAILURE; }
     if (sem_init(&slots, 0, MAX_WORKERS)) { perror("sem_init"); return EXIT_FAILURE; }
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) { perror("socket"); return EXIT_FAILURE; }

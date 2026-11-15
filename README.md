@@ -2,7 +2,7 @@
 
 A C-based operating systems project that forwards HTTP requests through a multithreaded proxy server and lets a client save the returned page as an HTML file.
 
-> **Status:** Planning and documentation. The implementation, build commands, and test results will be added as development progresses.
+> **Status:** Milestones 1 and 2 implemented: plain HTTP forwarding and a dedicated HTML-saving client. HTTPS, redirect following, and batch client mode are not implemented yet.
 
 ## Overview
 
@@ -16,16 +16,17 @@ This project demonstrates socket programming, concurrent request handling, and r
 - Accept a URL from the client, fetch the corresponding page, and return the response.
 - Allow the client to save the returned page as an HTML file with an appropriate filename.
 
-## Planned Features
+## Implemented Features
 
-- **URL input:** Accept a destination URL through a command-line client.
-- **Request forwarding:** Connect to the destination server and forward an HTTP GET request.
-- **Concurrent clients:** Handle multiple client connections using POSIX threads.
-- **HTML output:** Save the response body to a user-specified or generated `.html` filename.
-- **Error handling:** Report invalid input, connection failures, and file-write failures.
-- **Resource cleanup:** Close sockets and files and release allocated memory after requests finish.
+- **URL input:** Accept a plain HTTP URL through the command-line client, including a path, query string, and explicit port. URL fragments are not sent to the website.
+- **Request forwarding:** The proxy resolves the destination and forwards an HTTP GET request. The client contacts the proxy rather than fetching the website directly.
+- **Concurrent clients:** Serve up to 32 active connections with detached POSIX worker threads. Excess connections receive HTTP 503.
+- **HTML output:** Save the response body to a chosen filename or generate one under `downloads/`. Automatic names receive numeric suffixes on collision. Explicit filenames are never overwritten.
+- **Response handling:** Read split headers, Content-Length, chunked transfer coding, and connection-close-delimited bodies. Only successful HTML responses with identity content encoding are saved.
+- **Failure handling:** Report invalid input, connection failures, destination HTTP errors, unsupported responses, and file-write failures. Failed downloads do not leave completed output files.
+- **Resource cleanup:** Close sockets and files and release per-request memory. Download into a temporary file and publish it only on success.
 
-The initial implementation is planned for plain HTTP. HTTPS support requires additional design and is not included in the initial scope. Response caching is an optional extension.
+The current implementation supports plain HTTP. HTTPS and redirect following are later milestones needed for broader webpage support. Response caching is an optional extension.
 
 ## How It Works
 
@@ -44,14 +45,14 @@ The proxy will accept incoming connections and assign each accepted connection t
 
 Saving an HTML response does not download all linked images, stylesheets, or scripts. A complete offline website downloader is outside the initial scope.
 
-## Planned Technology Stack
+## Technology Stack
 
 | Component | Technology |
 | --- | --- |
 | Programming language | C |
 | Network communication | TCP sockets and HTTP |
 | Concurrency | POSIX threads (`pthread`) |
-| Synchronization, where needed | Mutexes or semaphores |
+| Connection limit | POSIX semaphore |
 | Development environment | Linux, or a Linux environment through WSL on Windows |
 | Compiler | GCC |
 | Version control | Git and GitHub |
@@ -65,21 +66,88 @@ The intended development environment needs:
 - Git for version control.
 - A text editor or IDE.
 
-Build and execution commands will be documented after the source files and command-line interface are implemented and tested. No runnable server or client is included yet.
+The project was built and tested in Ubuntu through WSL. Run the following commands in a Linux terminal, from the project directory. Native Windows MinGW is not the target for this POSIX implementation.
+
+```bash
+make
+```
+
+Start the proxy in one terminal:
+
+```bash
+./proxy_server 8080
+```
+
+In another terminal, fetch an HTTP page through the proxy:
+
+```bash
+./proxy_client 127.0.0.1 8080 http://example.com/ --output page.html
+```
+
+Omit `--output` to generate a filename:
+
+```bash
+./proxy_client 127.0.0.1 8080 http://example.com/
+```
+
+Public sites may redirect to HTTPS or reject automated requests. For a repeatable offline demonstration, create a small HTML page and start a local origin server in a third terminal:
+
+```bash
+mkdir -p /tmp/os-proxy-demo
+printf '<html><body>Hello from our proxy project!</body></html>\n' > /tmp/os-proxy-demo/index.html
+python3 -m http.server 8000 --bind 127.0.0.1 --directory /tmp/os-proxy-demo
+```
+
+Then run the client, keeping the proxy running:
+
+```bash
+./proxy_client 127.0.0.1 8080 http://127.0.0.1:8000/index.html --output demo.html
+```
+
+The output shows the HTTP status, saved body size, and filename. An existing explicit output file causes an error; choose another name or omit `--output` for automatic collision handling.
+
+The listener binds to `127.0.0.1`, so the client and proxy should run in the same Linux environment for this milestone. Stop the proxy with Ctrl+C.
+
+## Source Files
+
+| File | Purpose |
+| --- | --- |
+| `proxy_server.c` | Accept client connections, create bounded workers, fetch and relay HTTP responses. |
+| `proxy_client.c` | Request a URL through the proxy, decode response framing, and save HTML. |
+| `net.c` / `net.h` | URL validation, destination resolution, timed connections, and complete socket writes. |
+| `tests/integration.py` | Local HTTP fixtures and end-to-end checks. |
+| `proxy_server_with_cache.c` / `proxy_server_without_cache.c` | Original tutorial reference implementations, preserved separately. |
+| `proxy_parse.c` / `proxy_parse.h` | Original tutorial parser; not linked into the new milestone executables. |
+
+`make tutorial` builds the preserved cached tutorial as `tutorial_proxy`. It is a reference target and does not include our dedicated HTML-saving client or fixes.
 
 ## Implementation Plan
 
-1. Define how the client sends a URL and how the proxy returns the response.
-2. Implement a single-client HTTP request and response flow.
-3. Add client-side saving of the HTML response body.
-4. Add worker threads to support concurrent client connections.
-5. Add input validation, error reporting, and resource cleanup.
-6. Test the required behavior and document reproducible build and run commands.
-7. Consider optional caching after the core requirements pass.
+The working HTTP server and HTML-saving client are implemented. Next: extend concurrency demonstrations and batch client support, then add HTTPS and redirects. Consider caching after the required workflow is complete.
 
 ## Validation Plan
 
-These checks are planned; they have not been run yet.
+Run the deterministic local checks with Python 3:
+
+```bash
+make test
+```
+
+For memory and undefined-behavior checks on the new executables:
+
+```bash
+make sanitize
+make test
+```
+
+Return to the normal build afterward:
+
+```bash
+make clean
+make
+```
+
+The regular build and the AddressSanitizer/UndefinedBehaviorSanitizer build each passed 29 end-to-end scenarios, including 16 concurrent downloads, with no reported sanitizer errors. Tests use a local origin and do not require a public website.
 
 | Scenario | Expected behavior |
 | --- | --- |
@@ -91,6 +159,16 @@ These checks are planned; they have not been run yet.
 | Response larger than one buffer | Data is transferred without truncation. |
 | Client disconnects during transfer | Worker cleans up its resources and the server remains available. |
 | Output file cannot be written | Client reports the file error. |
+
+## Current Limitations
+
+- Plain HTTP GET only. HTTPS, automatic redirects, authentication, cookies, and JavaScript execution are not supported yet.
+- The client saves HTML/XHTML only and requests uncompressed data. If the origin still returns compressed content, the client rejects it rather than save incorrect HTML.
+- Downloads are limited to 50 MiB. Client response headers are limited to 64 KiB; incoming proxy requests are limited to 16 KiB.
+- Socket transfer operations time out after 15 seconds without progress; connection attempts use a 10-second timeout per destination address. System DNS resolution follows the resolver's own timeout behavior.
+- A close-delimited response has no declared body length, so an early clean EOF cannot always be distinguished from a complete response. Declared-length and chunked truncation are detected.
+- The server is multithreaded; this version of the client fetches one URL per invocation. Multiple client processes can run concurrently.
+- Completed files are finalized using POSIX hard links. Use a filesystem that supports them. No cache is enabled in the project executables.
 
 ## Concepts to Understand for the Viva
 
@@ -109,7 +187,7 @@ These checks are planned; they have not been run yet.
 - Record request logs and response times.
 - Compare sequential and concurrent request handling.
 - Replace unbounded thread creation with a worker pool or a connection limit.
-- Add connection and transfer timeouts.
+- Add HTTPS and redirect handling.
 
 ## Academic Context
 

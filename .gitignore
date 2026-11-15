@@ -1,1 +1,8 @@
 ACADEMIC DOCS/
+/proxy_server
+/proxy_client
+/tutorial_proxy
+/*.o
+/downloads/
+*.part??????
+__pycache__/

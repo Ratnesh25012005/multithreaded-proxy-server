@@ -1,0 +1,5 @@
+# Start the local demo origin on port 8000 first (see README).
+# One plain HTTP URL per line. Blank lines and comments are allowed.
+http://127.0.0.1:8000/index.html
+http://127.0.0.1:8000/index.html?copy=2
+http://127.0.0.1:8000/index.html?copy=3

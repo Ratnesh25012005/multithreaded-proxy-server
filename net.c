@@ -30,7 +30,7 @@ int parse_http_url(const char *text, struct http_url *url, char *error, size_t s
     for (const char *p = text; *p; ++p)
         if ((unsigned char)*p <= 32 || (unsigned char)*p >= 127) goto fail;
     if (strncmp(text, "http://", 7)) {
-        why = "Only http:// URLs are supported in milestones 1 and 2";
+        why = "Only http:// URLs are supported; HTTPS is a later milestone";
         goto fail;
     }
     const char *start = text + 7;

@@ -15,6 +15,10 @@
 #define MAX_WORKERS 32
 #define REQUEST_LIMIT 16384
 static sem_t slots;
+struct connection {
+    int socket;
+    unsigned long id;
+};
 
 static void reply_error(int client, int status, const char *reason, const char *message) {
     char body[512], header[512];
@@ -28,9 +32,13 @@ static void reply_error(int client, int status, const char *reason, const char *
 
 /* Each worker owns its client socket and upstream socket. No shared buffers. */
 static void *serve_client(void *context) {
-    int client = *(int *)context;
+    struct connection connection = *(struct connection *)context;
+    int client = connection.socket;
     free(context);
     int upstream = -1;
+    size_t relayed = 0;
+    const char *outcome = "client closed or request timed out";
+    fprintf(stderr, "[request %lu] worker started\n", connection.id);
     char request[REQUEST_LIMIT + 1];
     size_t used = 0;
     while (used < REQUEST_LIMIT) {
@@ -50,6 +58,7 @@ static void *serve_client(void *context) {
         goto cleanup;
     }
     char *line_end = strstr(request, "\r\n");
+    outcome = "request rejected";
     *line_end = '\0';
     char *url_text = strchr(request, ' ');
     if (!url_text) goto malformed;
@@ -70,6 +79,8 @@ static void *serve_client(void *context) {
     }
     upstream = connect_tcp(url.host, url.port);
     if (upstream < 0) {
+        outcome = "destination connection failed";
+        fprintf(stderr, "[request %lu] could not connect to %s:%s\n", connection.id, url.host, url.port);
         reply_error(client, 502, "Bad Gateway", "Could not connect to the destination.");
         goto cleanup;
     }
@@ -80,10 +91,12 @@ static void *serve_client(void *context) {
                           "Accept-Encoding: identity\r\nConnection: close\r\n\r\n", url.path, url.authority);
     if (length < 0 || (size_t)length >= sizeof(outbound)
         || send_all(upstream, outbound, (size_t)length)) {
+        outcome = "destination request send failed";
         reply_error(client, 502, "Bad Gateway", "Could not send the destination request.");
         goto cleanup;
     }
-    fprintf(stderr, "Fetching %s\n", url_text);
+    fprintf(stderr, "[request %lu] fetching %s\n", connection.id, url_text);
+    outcome = "forwarding failed";
     char buffer[8192];
     int started = 0;
     for (;;) {
@@ -91,10 +104,12 @@ static void *serve_client(void *context) {
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             if (!started) reply_error(client, 502, "Bad Gateway", "Destination returned no response.");
+            outcome = n < 0 ? "upstream receive failed or timed out" : "upstream closed";
             break;
         }
         started = 1;
-        if (send_all(client, buffer, (size_t)n)) break;
+        if (send_all(client, buffer, (size_t)n)) { outcome = "client disconnected or send timed out"; break; }
+        relayed += (size_t)n;
     }
     goto cleanup;
 malformed:
@@ -102,6 +117,8 @@ malformed:
 cleanup:
     if (upstream >= 0) close(upstream);
     close(client);
+    fprintf(stderr, "[request %lu] worker finished: %s; %zu response bytes relayed\n",
+            connection.id, outcome, relayed);
     sem_post(&slots);
     return NULL;
 }
@@ -125,17 +142,20 @@ int main(int argc, char **argv) {
         perror("listen/bind"); close(listener); return EXIT_FAILURE;
     }
     fprintf(stderr, "HTTP proxy listening on 127.0.0.1:%s (%d workers maximum)\n", argv[1], MAX_WORKERS);
+    unsigned long next_id = 1;
     for (;;) {
         int client = accept(listener, NULL, NULL);
         if (client < 0) { if (errno == EINTR) continue; perror("accept"); break; }
         if (set_socket_timeout(client)) { close(client); continue; }
+        unsigned long id = next_id++;
         if (sem_trywait(&slots)) {
             reply_error(client, 503, "Service Unavailable", "All workers are busy. Try again later.");
+            fprintf(stderr, "[request %lu] rejected: all %d workers are busy\n", id, MAX_WORKERS);
             close(client); continue;
         }
-        int *context = malloc(sizeof(*context));
+        struct connection *context = malloc(sizeof(*context));
         if (!context) { close(client); sem_post(&slots); continue; }
-        *context = client;
+        *context = (struct connection){.socket = client, .id = id};
         pthread_attr_t attributes;
         int status = pthread_attr_init(&attributes);
         if (!status) {

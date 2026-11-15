@@ -2,7 +2,7 @@
 
 A C-based operating systems project that forwards HTTP requests through a multithreaded proxy server and lets a client save the returned page as an HTML file.
 
-> **Status:** Milestones 1 and 2 implemented: plain HTTP forwarding and a dedicated HTML-saving client. HTTPS, redirect following, and batch client mode are not implemented yet.
+> **Status:** Milestones 1-3 implemented: plain HTTP forwarding, HTML saving, and bounded multithreading in both server and batch client. HTTPS and redirect following are not implemented yet.
 
 ## Overview
 
@@ -21,6 +21,8 @@ This project demonstrates socket programming, concurrent request handling, and r
 - **URL input:** Accept a plain HTTP URL through the command-line client, including a path, query string, and explicit port. URL fragments are not sent to the website.
 - **Request forwarding:** The proxy resolves the destination and forwards an HTTP GET request. The client contacts the proxy rather than fetching the website directly.
 - **Concurrent clients:** Serve up to 32 active connections with detached POSIX worker threads. Excess connections receive HTTP 503.
+- **Threaded batch downloads:** Download a URL list with 1-16 client workers (default 4). Each job owns its socket and output file; all filenames are assigned before workers start.
+- **Request logs:** Server logs carry request identifiers, worker start/finish events, and relayed byte counts. Batch results identify each URL and summarize saved and failed jobs.
 - **HTML output:** Save the response body to a chosen filename or generate one under `downloads/`. Automatic names receive numeric suffixes on collision. Explicit filenames are never overwritten.
 - **Response handling:** Read split headers, Content-Length, chunked transfer coding, and connection-close-delimited bodies. Only successful HTML responses with identity content encoding are saved.
 - **Failure handling:** Report invalid input, connection failures, destination HTTP errors, unsupported responses, and file-write failures. Failed downloads do not leave completed output files.
@@ -108,14 +110,32 @@ The output shows the HTTP status, saved body size, and filename. An existing exp
 
 The listener binds to `127.0.0.1`, so the client and proxy should run in the same Linux environment for this milestone. Stop the proxy with Ctrl+C.
 
+## Multithreaded Batch Client
+
+Keep the proxy and local demo origin running, then run:
+
+```bash
+./proxy_client 127.0.0.1 8080 --batch examples/urls.txt --jobs 3
+```
+
+The example list requests the local HTML page three times with different query strings. For other pages, create a text file containing one HTTP URL per line. Blank lines and lines starting with `#` are ignored; the whole list is validated before downloads begin.
+
+Each run creates a unique `downloads/batch_XXXXXX/` directory. Files are named with the job number and sanitized hostname/path, such as `0001_127.0.0.1_index.html`. Duplicate URLs and simultaneous batch runs cannot select the same output path.
+
+The client creates no more than `--jobs` worker threads, up to 16. A mutex protects the shared job index; network requests run outside that lock. It joins its workers before reporting the final result. The server independently limits active workers to 32 using a semaphore and releases each slot when its worker exits.
+
+Failed jobs do not stop unrelated downloads. The final summary reports saved/failed counts; the process exits with a nonzero status if any job failed. A batch accepts at most 1000 URLs. `--output` is available only in single-URL mode.
+
 ## Source Files
 
 | File | Purpose |
 | --- | --- |
 | `proxy_server.c` | Accept client connections, create bounded workers, fetch and relay HTTP responses. |
-| `proxy_client.c` | Request a URL through the proxy, decode response framing, and save HTML. |
+| `proxy_client.c` | Fetch one URL or a batch through the proxy, decode response framing, and save HTML. |
 | `net.c` / `net.h` | URL validation, destination resolution, timed connections, and complete socket writes. |
 | `tests/integration.py` | Local HTTP fixtures and end-to-end checks. |
+| `tests/concurrency.py` | Client worker limits, server saturation/recovery, timeouts, disconnects, and connection churn. |
+| `examples/urls.txt` | Small batch input for the local demo origin. |
 | `proxy_server_with_cache.c` / `proxy_server_without_cache.c` | Original tutorial reference implementations, preserved separately. |
 | `proxy_parse.c` / `proxy_parse.h` | Original tutorial parser; not linked into the new milestone executables. |
 
@@ -123,7 +143,7 @@ The listener binds to `127.0.0.1`, so the client and proxy should run in the sam
 
 ## Implementation Plan
 
-The working HTTP server and HTML-saving client are implemented. Next: extend concurrency demonstrations and batch client support, then add HTTPS and redirects. Consider caching after the required workflow is complete.
+The HTTP server, HTML-saving client, and concurrency milestone are implemented. Next: add HTTPS and redirects. Consider caching after the required workflow is complete.
 
 ## Validation Plan
 
@@ -147,7 +167,7 @@ make clean
 make
 ```
 
-The regular build and the AddressSanitizer/UndefinedBehaviorSanitizer build each passed 29 end-to-end scenarios, including 16 concurrent downloads, with no reported sanitizer errors. Tests use a local origin and do not require a public website.
+Normal and AddressSanitizer/UndefinedBehaviorSanitizer builds each passed 29 end-to-end scenarios and 10 concurrency scenarios, with no reported sanitizer errors. These include 16 concurrent downloads, a bounded threaded batch, 410 sequential requests, all 32 server slots in use, overload rejection/recovery, a client reset, and an idle-request timeout. Tests use a local origin and do not require a public website.
 
 | Scenario | Expected behavior |
 | --- | --- |
@@ -167,7 +187,7 @@ The regular build and the AddressSanitizer/UndefinedBehaviorSanitizer build each
 - Downloads are limited to 50 MiB. Client response headers are limited to 64 KiB; incoming proxy requests are limited to 16 KiB.
 - Socket transfer operations time out after 15 seconds without progress; connection attempts use a 10-second timeout per destination address. System DNS resolution follows the resolver's own timeout behavior.
 - A close-delimited response has no declared body length, so an early clean EOF cannot always be distinguished from a complete response. Declared-length and chunked truncation are detected.
-- The server is multithreaded; this version of the client fetches one URL per invocation. Multiple client processes can run concurrently.
+- The server serves at most 32 active requests. Multiple batch clients can exceed that limit and receive HTTP 503; automatic retries are not implemented.
 - Completed files are finalized using POSIX hard links. Use a filesystem that supports them. No cache is enabled in the project executables.
 
 ## Concepts to Understand for the Viva
@@ -184,9 +204,9 @@ The regular build and the AddressSanitizer/UndefinedBehaviorSanitizer build each
 ## Possible Extensions
 
 - Add a bounded, thread-safe response cache with an LRU eviction policy.
-- Record request logs and response times.
+- Add request timing and performance measurements to the existing request logs.
 - Compare sequential and concurrent request handling.
-- Replace unbounded thread creation with a worker pool or a connection limit.
+- Compare the current bounded per-connection server workers with a persistent worker pool.
 - Add HTTPS and redirect handling.
 
 ## Academic Context

@@ -9,7 +9,7 @@ proxy_server: proxy_server.c net.c net.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) proxy_server.c net.c $(LDFLAGS) -o $@
 
 proxy_client: proxy_client.c net.c net.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) proxy_client.c net.c $(LDFLAGS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) proxy_client.c net.c $(LDFLAGS) -o $@
 
 # Original tutorial implementation, preserved for comparison only.
 tutorial: proxy_server_with_cache.c proxy_parse.c proxy_parse.h
@@ -17,6 +17,7 @@ tutorial: proxy_server_with_cache.c proxy_parse.c proxy_parse.h
 
 test: all
 	python3 tests/integration.py
+	python3 tests/concurrency.py
 
 sanitize:
 	$(MAKE) clean

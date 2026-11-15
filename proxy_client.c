@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -181,18 +182,14 @@ static void filename_base(const struct http_url *url, char *base, size_t capacit
     if (!*base) strcpy(base, "page");
 }
 
-int main(int argc, char **argv) {
-    if ((argc != 4 && argc != 6) || (argc == 6 && strcmp(argv[4], "--output"))
-        || !valid_port(argv[2])) {
-        fprintf(stderr, "Usage: %s PROXY_HOST PROXY_PORT HTTP_URL [--output FILE.html]\n", argv[0]);
-        return EXIT_FAILURE;
-    }
+static int download(const char *proxy_host, const char *proxy_port, const char *url_text,
+                    const char *requested_output) {
     struct http_url url;
     char error[160];
-    if (parse_http_url(argv[3], &url, error, sizeof(error))) {
+    if (parse_http_url(url_text, &url, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error); return EXIT_FAILURE;
     }
-    int fd = connect_tcp(argv[1], argv[2]);
+    int fd = connect_tcp(proxy_host, proxy_port);
     if (fd < 0) { fprintf(stderr, "Could not connect to proxy.\n"); return EXIT_FAILURE; }
     int result = EXIT_FAILURE;
     FILE *file = NULL;
@@ -200,7 +197,7 @@ int main(int argc, char **argv) {
     char request[URL_LIMIT + 512];
     int n = snprintf(request, sizeof(request),
                      "GET %s HTTP/1.0\r\nHost: %s\r\nAccept: text/html,application/xhtml+xml\r\n"
-                     "Accept-Encoding: identity\r\nConnection: close\r\n\r\n", argv[3], url.authority);
+                     "Accept-Encoding: identity\r\nConnection: close\r\n\r\n", url_text, url.authority);
     if (n < 0 || (size_t)n >= sizeof(request) || send_all(fd, request, (size_t)n)) {
         fprintf(stderr, "Could not send request to proxy.\n"); goto cleanup;
     }
@@ -209,9 +206,15 @@ int main(int argc, char **argv) {
     if (read_headers(&reader, &response)) {
         fprintf(stderr, "Incomplete, oversized, or unsupported HTTP response headers.\n"); goto cleanup;
     }
-    printf("HTTP status: %d\n", response.status);
+    printf("HTTP status: %d [%s]\n", response.status, url_text);
     if (response.status < 200 || response.status >= 300) {
-        fprintf(stderr, "HTTP %d: page not saved. Redirect following is not implemented yet.\n", response.status);
+        if (response.status >= 300 && response.status < 400)
+            fprintf(stderr, "HTTP %d: page not saved. Redirect following is not implemented yet.\n", response.status);
+        else if (response.status == 502)
+            fprintf(stderr, "HTTP 502 Bad Gateway: destination fetch failed; page not saved. "
+                            "Check the destination URL and that its server is running.\n");
+        else
+            fprintf(stderr, "HTTP %d: server returned an error; page not saved.\n", response.status);
         goto cleanup;
     }
     if (!response.html || response.encoded) {
@@ -220,7 +223,7 @@ int main(int argc, char **argv) {
     if (response.has_length && response.length > BODY_LIMIT) {
         fprintf(stderr, "Response exceeds the 50 MiB download limit.\n"); goto cleanup;
     }
-    if (argc == 6) n = snprintf(output, sizeof(output), "%s", argv[5]);
+    if (requested_output) n = snprintf(output, sizeof(output), "%s", requested_output);
     else {
         if (mkdir("downloads", 0755) && errno != EEXIST) { perror("downloads"); goto cleanup; }
         filename_base(&url, base, sizeof(base));
@@ -243,7 +246,7 @@ int main(int argc, char **argv) {
     /* Publish the completed file atomically, without overwriting an existing name. */
     unsigned suffix = 0;
     while (link(temporary, output)) {
-        if (errno != EEXIST || argc == 6 || ++suffix > 10000) {
+        if (errno != EEXIST || requested_output || ++suffix > 10000) {
             perror("Cannot finalize output (existing files are never overwritten)"); goto cleanup;
         }
         snprintf(output, sizeof(output), "downloads/%s_%u.html", base, suffix);
@@ -255,4 +258,122 @@ cleanup:
     if (*temporary) unlink(temporary);
     close(fd);
     return result;
+}
+
+#define MAX_BATCH_URLS 1000
+#define MAX_CLIENT_WORKERS 16
+struct download_job {
+    char url[URL_LIMIT];
+    char output[PATH_MAX];
+    int result;
+};
+struct batch {
+    const char *host, *port;
+    struct download_job *jobs;
+    size_t count, next;
+    pthread_mutex_t lock;
+};
+
+/* Only taking the next job needs a lock; every download owns its buffers and socket. */
+static void *batch_worker(void *context) {
+    struct batch *batch = context;
+    for (;;) {
+        pthread_mutex_lock(&batch->lock);
+        size_t index = batch->next;
+        if (index < batch->count) ++batch->next;
+        pthread_mutex_unlock(&batch->lock);
+        if (index >= batch->count) break;
+        struct download_job *job = &batch->jobs[index];
+        job->result = download(batch->host, batch->port, job->url, job->output);
+        fprintf(stderr, "[job %zu] %s: %s\n", index + 1,
+                job->result == EXIT_SUCCESS ? "saved" : "failed", job->url);
+    }
+    return NULL;
+}
+
+static int run_batch(const char *host, const char *port, const char *filename, size_t workers) {
+    FILE *input = fopen(filename, "r");
+    if (!input) { perror("URL list"); return EXIT_FAILURE; }
+    struct download_job *jobs = calloc(MAX_BATCH_URLS, sizeof(*jobs));
+    if (!jobs) { fclose(input); return EXIT_FAILURE; }
+    char *line = NULL;
+    size_t capacity = 0, count = 0, line_number = 0;
+    ssize_t length;
+    int result = EXIT_FAILURE;
+    while ((length = getline(&line, &capacity, input)) >= 0) {
+        ++line_number;
+        if (memchr(line, '\0', (size_t)length)) {
+            fprintf(stderr, "URL list line %zu contains a NUL byte.\n", line_number); goto cleanup;
+        }
+        while (length && isspace((unsigned char)line[length - 1])) line[--length] = '\0';
+        char *start = line;
+        while (*start == ' ' || *start == '\t') ++start;
+        if (!*start || *start == '#') continue;
+        struct http_url parsed;
+        char error[160];
+        if (count == MAX_BATCH_URLS || parse_http_url(start, &parsed, error, sizeof(error))) {
+            fprintf(stderr, "Invalid URL list at line %zu (HTTP URLs only; maximum %d entries).\n",
+                    line_number, MAX_BATCH_URLS); goto cleanup;
+        }
+        strcpy(jobs[count++].url, start);
+    }
+    if (ferror(input) || !count) { fprintf(stderr, "URL list is empty or unreadable.\n"); goto cleanup; }
+    if (mkdir("downloads", 0755) && errno != EEXIST) { perror("downloads"); goto cleanup; }
+    char directory[] = "downloads/batch_XXXXXX";
+    if (!mkdtemp(directory)) { perror("Batch directory"); goto cleanup; }
+    /* Reserve a unique directory and assign all names before any worker is started. */
+    for (size_t i = 0; i < count; ++i) {
+        struct http_url parsed;
+        char error[160], base[160];
+        parse_http_url(jobs[i].url, &parsed, error, sizeof(error));
+        filename_base(&parsed, base, sizeof(base));
+        snprintf(jobs[i].output, sizeof(jobs[i].output), "%s/%04zu_%s.html", directory, i + 1, base);
+        jobs[i].result = EXIT_FAILURE;
+    }
+    if (workers > count) workers = count;
+    struct batch batch = {.host = host, .port = port, .jobs = jobs, .count = count};
+    int status = pthread_mutex_init(&batch.lock, NULL);
+    if (status) { fprintf(stderr, "Batch mutex: %s\n", strerror(status)); goto cleanup; }
+    pthread_t threads[MAX_CLIENT_WORKERS];
+    size_t started = 0;
+    printf("Batch: %zu URLs, %zu workers maximum, output %s\n", count, workers, directory);
+    for (; started < workers; ++started) {
+        status = pthread_create(&threads[started], NULL, batch_worker, &batch);
+        if (status) {
+            fprintf(stderr, "Worker creation: %s; using main thread for remaining work.\n", strerror(status));
+            batch_worker(&batch);
+            break;
+        }
+    }
+    for (size_t i = 0; i < started; ++i) pthread_join(threads[i], NULL);
+    pthread_mutex_destroy(&batch.lock);
+    size_t saved = 0;
+    for (size_t i = 0; i < count; ++i) if (jobs[i].result == EXIT_SUCCESS) ++saved;
+    printf("Batch complete: %zu saved, %zu failed. Output: %s\n", saved, count - saved, directory);
+    result = saved == count ? EXIT_SUCCESS : EXIT_FAILURE;
+cleanup:
+    free(line);
+    free(jobs);
+    fclose(input);
+    return result;
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 4 && valid_port(argv[2])) {
+        if ((argc == 5 || argc == 7) && !strcmp(argv[3], "--batch")) {
+            size_t workers = 4;
+            if (argc == 7) {
+                if (strcmp(argv[5], "--jobs") || !valid_port(argv[6])) goto usage;
+                workers = (size_t)strtoul(argv[6], NULL, 10);
+                if (workers > MAX_CLIENT_WORKERS) goto usage;
+            }
+            return run_batch(argv[1], argv[2], argv[4], workers);
+        }
+        if (argc == 4 || (argc == 6 && !strcmp(argv[4], "--output")))
+            return download(argv[1], argv[2], argv[3], argc == 6 ? argv[5] : NULL);
+    }
+usage:
+    fprintf(stderr, "Usage: %s PROXY_HOST PROXY_PORT HTTP_URL [--output FILE.html]\n"
+                    "       %s PROXY_HOST PROXY_PORT --batch URLS.txt [--jobs 1-16]\n", argv[0], argv[0]);
+    return EXIT_FAILURE;
 }

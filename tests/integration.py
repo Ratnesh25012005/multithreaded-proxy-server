@@ -20,7 +20,18 @@ def free_port():
 
 
 class Origin(socketserver.BaseRequestHandler):
+    condition = threading.Condition()
+    active = 0
+    peak = 0
+    held = 0
+    hold_release = threading.Event()
+    slow_started = threading.Event()
+    slow_release = threading.Event()
+
     def handle(self):
+        with Origin.condition:
+            Origin.active += 1
+            Origin.peak = max(Origin.peak, Origin.active)
         try:
             self.request.settimeout(5)
             request = b""
@@ -32,6 +43,14 @@ class Origin(socketserver.BaseRequestHandler):
             # This also verifies the client is using our proxy, not fetching directly.
             assert b"User-Agent: OSProjectProxy/1.0" in request
             path = request.split(b" ")[1]
+            if path == b"/hold":
+                with Origin.condition:
+                    Origin.held += 1
+                    Origin.condition.notify_all()
+                Origin.hold_release.wait(10)
+            if path == b"/slowflag":
+                Origin.slow_started.set()
+                Origin.slow_release.wait(10)
             body = LARGE if path == b"/large" else SMALL
             if path.startswith(b"/unique/"):
                 body = b"<html>" + path + b"</html>"
@@ -74,11 +93,16 @@ class Origin(socketserver.BaseRequestHandler):
                 self.request.sendall(payload)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        finally:
+            with Origin.condition:
+                Origin.active -= 1
+                Origin.condition.notify_all()
 
 
 class OriginServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 64
 
 
 def main():
@@ -132,7 +156,11 @@ def main():
 
                 for path in ["/truncated", "/badchunk", "/conflict", "/both", "/huge", "/longheader",
                              "/empty", "/404", "/redirect", "/binary", "/gzip"]:
-                    run(path, "failed.html", success=False)
+                    failed = run(path, "failed.html", success=False)
+                    if path == "/redirect":
+                        assert b"Redirect following" in failed.stderr
+                    elif path == "/404":
+                        assert b"HTTP 404" in failed.stderr and b"Redirect" not in failed.stderr
                     assert not (Path(tmp) / "failed.html").exists()
                     assert not list(Path(tmp).rglob("*.part*"))
                     count += 1
@@ -141,7 +169,8 @@ def main():
                 run("/", success=False, url="https://example.com/")
                 run("/", success=False, url="http://bad host/")
                 dead_port = free_port()
-                run("/", success=False, url=f"http://127.0.0.1:{dead_port}/")
+                failed = run("/", success=False, url=f"http://127.0.0.1:{dead_port}/")
+                assert b"Bad Gateway" in failed.stderr and b"Redirect" not in failed.stderr
                 count += 4
 
                 def fetch_unique(i):

@@ -31,18 +31,19 @@ This project demonstrates socket programming, concurrent request handling, and r
 
 Response caching remains an optional extension. A website can still reject automated requests or require authentication or browser execution.
 
+## System Architecture
+
+![Handwritten system architecture](docs/images/system-architecture-handwritten.png)
+
 ## How It Works
 
-```text
-Client                         Proxy Server                   Destination Server
-  |                                  |                                |
-  |---------- Send URL ------------->|                                |
-  |                                  |----- Forward HTTP request ---->|
-  |                                  |<-------- HTTP response --------|
-  |<--------- Return response -------|                                |
-  |                                  |                                |
-  +-- Save response body as HTML      +-- Clean up request resources   |
-```
+![Handwritten activity flow of the multithreaded proxy server and client](docs/images/project-flow-handwritten.png)
+
+[Open the scalable SVG diagram](docs/images/project-flow.svg)
+
+### Single Request Sequence
+
+![Handwritten request sequence](docs/images/request-sequence-handwritten.png)
 
 The proxy accepts incoming connections and assigns each accepted connection to a worker thread. Each worker owns a libcurl handle and a temporary response file. It first fetches the complete, decoded body within the size/time limits, then returns the final status, content type, final URL, redirect count, and body. Temporary files are closed on success and failure.
 
@@ -161,7 +162,7 @@ Failed jobs do not stop unrelated downloads. The final summary reports saved/fai
 
 ## Implementation Plan
 
-The HTTP/HTTPS server, HTML-saving client, concurrency, and URL-support milestones are implemented. Next: consolidate the final demonstration and viva documentation. Consider caching only as an optional extension.
+The required HTTP/HTTPS fetching, HTML-saving client, concurrency, and validation milestones are complete. Caching remains an optional extension.
 
 ## Validation Plan
 
@@ -222,20 +223,6 @@ This replaces the default CA bundle for that server process. The default public-
 - Declared-length and chunked truncation are detected before returning a successful fetch. An upstream close-delimited body has no declared length with which to distinguish an early clean EOF from completion.
 - The server serves at most 32 active requests. Multiple batch clients can exceed that limit and receive HTTP 503; automatic retries are not implemented.
 - Completed files are finalized using POSIX hard links. Use a filesystem that supports them. No cache is enabled in the project executables.
-
-## Concepts to Understand for the Viva
-
-- **Proxy server:** Why a client sends requests through an intermediary.
-- **Sockets:** How the client, proxy, and destination establish connections.
-- **Threads and processes:** Why this design uses threads to handle concurrent clients.
-- **Concurrency and parallelism:** How multiple requests can make progress at once.
-- **HTTP:** How a request, status line, headers, and response body fit together.
-- **TCP streams:** Why one send or receive operation may not transfer an entire message.
-- **Synchronization:** When shared data needs protection and when request-local data does not.
-- **Resource management:** How sockets, thread resources, files, and memory are released.
-- **HTTPS:** Why destination certificate and hostname verification are needed, and which connection uses TLS.
-- **Library boundaries:** Our C code owns the client/proxy sockets and threading; libcurl handles the destination's HTTP/HTTPS protocol details.
-- **Redirects and normalization:** Why the final response gets new body-length framing after redirects and decompression.
 
 ## Possible Extensions
 
